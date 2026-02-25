@@ -95,9 +95,46 @@ def build_embed(title, description, color):
     embed.set_footer(text=FOOTER_TEXT)
     return embed
 
+def guild_only():
+    async def predicate(interaction: discord.Interaction):
+        if interaction.guild is None:
+            await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+            return False
+        return True
+    return app_commands.check(predicate)
+
+async def apply_slot_permissions(channel: discord.TextChannel, owner: discord.Member, guild: discord.Guild):
+    await channel.set_permissions(guild.default_role, overwrite=discord.PermissionOverwrite(
+        read_messages=True,
+        send_messages=False,
+        send_messages_in_threads=False,
+        create_public_threads=False,
+        create_private_threads=False,
+        add_reactions=False,
+        mention_everyone=False
+    ))
+    await channel.set_permissions(owner, overwrite=discord.PermissionOverwrite(
+        read_messages=True,
+        send_messages=True,
+        embed_links=True,
+        attach_files=True,
+        add_reactions=True,
+        manage_channels=True,
+        create_public_threads=False,
+        create_private_threads=False,
+        mention_everyone=False
+    ))
+    await channel.set_permissions(guild.me, overwrite=discord.PermissionOverwrite(
+        read_messages=True,
+        send_messages=True,
+        manage_channels=True,
+        manage_permissions=True
+    ))
+
 @bot.event
 async def on_ready():
     await bot.tree.sync()
+    await bot.change_presence(activity=discord.CustomActivity(name="Shampoo MP"))
     print(f"Logged in as {bot.user}")
 
 @bot.tree.command(name="generatekeys", description="Generate keys for slots, @here pings, or @everyone pings")
@@ -111,6 +148,7 @@ async def on_ready():
     app_commands.Choice(name="@here Ping", value=KEY_TYPE_HERE),
     app_commands.Choice(name="@everyone Ping", value=KEY_TYPE_EVERYONE),
 ])
+@guild_only()
 async def generatekeys(interaction: discord.Interaction, type: str, amount: int, duration: int = None):
     if not is_admin(interaction.user.id):
         await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
@@ -153,6 +191,7 @@ async def generatekeys(interaction: discord.Interaction, type: str, amount: int,
 
 @bot.tree.command(name="sendkey", description="Generate and DM a key directly to a user")
 @app_commands.describe(user="The user to send the key to", duration="Duration of the key in days")
+@guild_only()
 async def sendkey(interaction: discord.Interaction, user: discord.Member, duration: int):
     if not is_admin(interaction.user.id):
         await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
@@ -203,6 +242,7 @@ async def sendkey(interaction: discord.Interaction, user: discord.Member, durati
 
 @bot.tree.command(name="redeem", description="Redeem a license key or ping key")
 @app_commands.describe(key="The key you want to redeem")
+@guild_only()
 async def redeem(interaction: discord.Interaction, key: str):
     valid_keys = load_json(VALID_KEYS_FILE)
     user_db = load_json(USER_DB_FILE)
@@ -271,31 +311,8 @@ async def redeem(interaction: discord.Interaction, key: str):
 
     channel_name = f"{interaction.user.name.lower().replace(' ', '-')}-slot"
 
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(
-            read_messages=True,
-            send_messages=False,
-            create_public_threads=False,
-            create_private_threads=False,
-            add_reactions=False
-        ),
-        interaction.user: discord.PermissionOverwrite(
-            read_messages=True,
-            send_messages=True,
-            embed_links=True,
-            attach_files=True,
-            add_reactions=True,
-            create_public_threads=False,
-            create_private_threads=False
-        ),
-        guild.me: discord.PermissionOverwrite(
-            read_messages=True,
-            send_messages=True,
-            manage_channels=True
-        )
-    }
-
-    channel = await guild.create_text_channel(channel_name, category=category, overwrites=overwrites)
+    channel = await guild.create_text_channel(channel_name, category=category)
+    await apply_slot_permissions(channel, interaction.user, guild)
 
     redeemed_at = datetime.utcnow().isoformat()
     expiry_iso = key_data["expiry"]
@@ -342,12 +359,74 @@ async def redeem(interaction: discord.Interaction, key: str):
     except discord.Forbidden:
         await interaction.response.send_message(f"✅ Key redeemed! Your slot channel {channel.mention} has been created. (Enable DMs to receive confirmation)", ephemeral=True)
 
+@bot.tree.command(name="make-slot", description="Assign an existing channel as a lifetime slot for a user")
+@app_commands.describe(user="The user to assign the slot to", channel="The existing channel to use as their slot")
+@guild_only()
+async def make_slot(interaction: discord.Interaction, user: discord.Member, channel: discord.TextChannel):
+    if not is_admin(interaction.user.id):
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        return
+
+    user_db = load_json(USER_DB_FILE)
+    user_id = str(user.id)
+
+    if user_id in user_db and user_db[user_id].get("active"):
+        await interaction.response.send_message(f"❌ {user.mention} already has an active slot.", ephemeral=True)
+        return
+
+    existing_uid, _ = find_user_by_channel(str(channel.id))
+    if existing_uid is not None:
+        await interaction.response.send_message("❌ That channel is already registered as a slot.", ephemeral=True)
+        return
+
+    await apply_slot_permissions(channel, user, interaction.guild)
+
+    assigned_at = datetime.utcnow().isoformat()
+
+    user_db[user_id] = {
+        "username": str(user),
+        "user_id": user_id,
+        "active": True,
+        "key_redeemed": "MANUAL",
+        "redeemed_at": assigned_at,
+        "expiry": None,
+        "duration_days": "Lifetime",
+        "time_remaining": "Lifetime",
+        "slot_channel_id": str(channel.id),
+        "slot_channel_name": channel.name,
+        "guild_id": str(interaction.guild.id),
+        "guild_name": interaction.guild.name,
+        "everyone_pings": 0,
+        "here_pings": 0
+    }
+    save_json(USER_DB_FILE, user_db)
+
+    embed = build_embed(
+        title=":rocket: **Lifetime Slot Activated**",
+        description=(
+            f"Hey {user.mention}, your **lifetime** slot has been set up by staff!\n\n"
+            f"Your dedicated channel is ready to go — use it to promote your products, services, or anything you'd like to share with the community.\n\n"
+            f"♾️ **Duration:** Lifetime\n"
+            f"📦 **Your Channel:** {channel.mention}\n\n"
+            f"Make the most of your slot and don't hesitate to reach out to staff if you need any assistance!"
+        ),
+        color=0xD2B48C
+    )
+
+    try:
+        await user.send(embed=embed)
+    except discord.Forbidden:
+        pass
+
+    await interaction.response.send_message(f"✅ {channel.mention} has been assigned as a lifetime slot for {user.mention}.", ephemeral=True)
+
 @bot.tree.command(name="ping", description="Send a @here or @everyone ping in your slot channel")
 @app_commands.describe(type="The type of ping to send")
 @app_commands.choices(type=[
     app_commands.Choice(name="@here", value="here"),
     app_commands.Choice(name="@everyone", value="everyone"),
 ])
+@guild_only()
 async def ping(interaction: discord.Interaction, type: str):
     user_id = str(interaction.user.id)
     user_db = load_json(USER_DB_FILE)
@@ -372,9 +451,10 @@ async def ping(interaction: discord.Interaction, type: str):
     save_json(USER_DB_FILE, user_db)
 
     await interaction.response.send_message("**Pinging...**")
-    await interaction.channel.send(f"{ping_label}" if type == "here" else "@everyone")
+    await interaction.channel.send("@here" if type == "here" else "@everyone")
 
 @bot.tree.command(name="stats", description="View your slot statistics")
+@guild_only()
 async def stats(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     user_db = load_json(USER_DB_FILE)
@@ -390,7 +470,7 @@ async def stats(interaction: discord.Interaction):
     data = user_db[user_id]
     everyone_pings = data.get("everyone_pings", 0)
     here_pings = data.get("here_pings", 0)
-    expiry_ts = int(datetime.fromisoformat(data["expiry"]).timestamp())
+    is_lifetime = data.get("duration_days") == "Lifetime"
 
     def ping_status(count):
         if count == 0:
@@ -399,6 +479,12 @@ async def stats(interaction: discord.Interaction):
             return f"🟡 **{count}** ping(s) remaining"
         else:
             return f"🟢 **{count}** ping(s) remaining"
+
+    if is_lifetime:
+        expiry_text = "♾️ **Never** — Lifetime slot"
+    else:
+        expiry_ts = int(datetime.fromisoformat(data["expiry"]).timestamp())
+        expiry_text = f"<t:{expiry_ts}:F> (<t:{expiry_ts}:R>)"
 
     embed = discord.Embed(
         title="📊 Slot Statistics",
@@ -419,8 +505,8 @@ async def stats(interaction: discord.Interaction):
         value=(
             f"**Channel:** <#{data['slot_channel_id']}>\n"
             f"**Active Since:** <t:{int(datetime.fromisoformat(data['redeemed_at']).timestamp())}:R>\n"
-            f"**Expires:** <t:{expiry_ts}:F> (<t:{expiry_ts}:R>)\n"
-            f"**Duration:** {data['duration_days']} day(s)"
+            f"**Expires:** {expiry_text}\n"
+            f"**Duration:** {data['duration_days']}"
         ),
         inline=False
     )
@@ -431,6 +517,7 @@ async def stats(interaction: discord.Interaction):
 
 @bot.tree.command(name="addadmin", description="Add a user as a bot admin")
 @app_commands.describe(user="The user to add as admin")
+@guild_only()
 async def addadmin(interaction: discord.Interaction, user: discord.Member):
     if interaction.user.id != MAIN_ADMIN_ID:
         await interaction.response.send_message("❌ Only the main admin can add admins.", ephemeral=True)
@@ -454,6 +541,7 @@ async def addadmin(interaction: discord.Interaction, user: discord.Member):
 
 @bot.tree.command(name="removeadmin", description="Remove a user from bot admins")
 @app_commands.describe(user="The user to remove from admins")
+@guild_only()
 async def removeadmin(interaction: discord.Interaction, user: discord.Member):
     if interaction.user.id != MAIN_ADMIN_ID:
         await interaction.response.send_message("❌ Only the main admin can remove admins.", ephemeral=True)
@@ -472,6 +560,7 @@ async def removeadmin(interaction: discord.Interaction, user: discord.Member):
 
 @bot.tree.command(name="terminateslot", description="Terminate a user's slot channel")
 @app_commands.describe(channel="The slot channel to terminate", reason="Reason for termination")
+@guild_only()
 async def terminateslot(interaction: discord.Interaction, channel: discord.TextChannel, reason: str):
     if not is_admin(interaction.user.id):
         await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
@@ -486,9 +575,23 @@ async def terminateslot(interaction: discord.Interaction, channel: discord.TextC
     guild = interaction.guild
     slot_owner = guild.get_member(int(user_id))
 
-    await channel.set_permissions(guild.default_role, read_messages=False)
+    await channel.set_permissions(guild.default_role, overwrite=discord.PermissionOverwrite(read_messages=False))
     if slot_owner:
-        await channel.set_permissions(slot_owner, read_messages=False, send_messages=False)
+        await channel.set_permissions(slot_owner, overwrite=discord.PermissionOverwrite(
+            read_messages=False,
+            send_messages=False,
+            embed_links=False,
+            attach_files=False,
+            add_reactions=False,
+            manage_channels=False,
+            manage_permissions=False,
+            manage_webhooks=False,
+            create_public_threads=False,
+            create_private_threads=False,
+            send_messages_in_threads=False,
+            mention_everyone=False,
+            view_channel=False
+        ))
 
     terminated_at = datetime.utcnow()
     deletion_time = terminated_at + timedelta(hours=8)
@@ -544,5 +647,15 @@ async def terminateslot(interaction: discord.Interaction, channel: discord.TextC
         await channel.delete(reason=f"Slot terminated by {interaction.user} — {reason}")
     except discord.NotFound:
         pass
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        if not interaction.response.is_done():
+            await interaction.response.send_message("❌ This command can only be used in a server.", ephemeral=True)
+    else:
+        if not interaction.response.is_done():
+            await interaction.response.send_message("❌ An error occurred while running this command.", ephemeral=True)
+        print(f"Command error: {error}")
 
 bot.run(TOKEN)
