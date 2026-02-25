@@ -21,7 +21,8 @@ if not os.path.exists(CONFIG_FILE):
     default_config['Discord'] = {'Token': 'YOUR_BOT_TOKEN_HERE'}
     default_config['Settings'] = {
         'slot_id': 'YOUR_CATEGORY_ID_HERE',
-        'Main_Admin_Id': 'YOUR_MAIN_ADMIN_ID_HERE'
+        'Main_Admin_Id': 'YOUR_MAIN_ADMIN_ID_HERE',
+        'Gateway_Channel_Id': 'YOUR_GATEWAY_CHANNEL_ID_HERE'
     }
     default_config['Embeds'] = {
         'Thumbnail_Url': 'YOUR_THUMBNAIL_URL_HERE'
@@ -42,6 +43,7 @@ config.read(CONFIG_FILE)
 TOKEN = config['Discord']['Token']
 SLOT_CATEGORY_ID = int(config['Settings']['slot_id'])
 MAIN_ADMIN_ID = int(config['Settings']['Main_Admin_Id'])
+GATEWAY_CHANNEL_ID = int(config['Settings']['Gateway_Channel_Id'])
 THUMBNAIL_URL = config['Embeds']['Thumbnail_Url']
 FOOTER_TEXT = "Shampoo MP"
 
@@ -51,6 +53,7 @@ KEY_TYPE_EVERYONE = "everyone_ping"
 KEY_TYPE_HERE = "here_ping"
 
 intents = discord.Intents.default()
+intents.members = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 def load_json(path):
@@ -170,6 +173,52 @@ async def on_ready():
     await bot.tree.sync()
     await bot.change_presence(activity=discord.CustomActivity(name="Shampoo MP"))
     print(f"Logged in as {bot.user}")
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    channel = member.guild.get_channel(GATEWAY_CHANNEL_ID)
+    if channel is None:
+        return
+    member_count = member.guild.member_count
+    joined_ts = int(member.joined_at.timestamp()) if member.joined_at else int(__import__('datetime').datetime.utcnow().timestamp())
+    embed = discord.Embed(
+        title="🎉 Welcome to Shampoo MP!",
+        description=(
+            f"Hey {member.mention}, welcome to **Shampoo MP**!\n\n"
+            f"We're glad to have you here. Browse our slots, grab a key, and set up your own space.\n\n"
+            f"📌 Use `/redeem` to activate a slot key.\n"
+            f"📣 Use `/ping` to ping your slot audience.\n"
+            f"📊 Use `/stats` to view your slot stats."
+        ),
+        color=0xFF4444
+    )
+    embed.add_field(name="👤 Member", value=f"{member.mention} (`{member.id}`)", inline=True)
+    embed.add_field(name="📅 Joined At", value=f"<t:{joined_ts}:F>", inline=True)
+    embed.add_field(name="👥 Member Count", value=f"**{member_count}** members", inline=False)
+    embed.set_thumbnail(url=THUMBNAIL_URL)
+    embed.set_footer(text=FOOTER_TEXT)
+    await channel.send(embed=embed)
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    channel = member.guild.get_channel(GATEWAY_CHANNEL_ID)
+    if channel is None:
+        return
+    member_count = member.guild.member_count
+    embed = discord.Embed(
+        title="👋 Member Left",
+        description=(
+            f"**{member.name}** has left **Shampoo MP**.\n\n"
+            f"We're sorry to see you go. You're always welcome back!"
+        ),
+        color=0x2b2b2b
+    )
+    embed.add_field(name="👤 Member", value=f"{member.mention} (`{member.id}`)", inline=True)
+    embed.add_field(name="👥 Remaining Members", value=f"**{member_count}** members", inline=False)
+    embed.set_thumbnail(url=THUMBNAIL_URL)
+    embed.set_footer(text=FOOTER_TEXT)
+    await channel.send(embed=embed)
 
 @bot.tree.command(name="generatekeys", description="Generate keys for slots, @here pings, or @everyone pings")
 @app_commands.describe(
