@@ -46,6 +46,7 @@ THUMBNAIL_URL = config['Embeds']['Thumbnail_Url']
 FOOTER_TEXT = "Shampoo MP"
 
 KEY_TYPE_LICENSE = "license"
+KEY_TYPE_LICENSE_LIFETIME = "license_lifetime"
 KEY_TYPE_EVERYONE = "everyone_ping"
 KEY_TYPE_HERE = "here_ping"
 
@@ -131,6 +132,39 @@ async def apply_slot_permissions(channel: discord.TextChannel, owner: discord.Me
         manage_permissions=True
     ))
 
+async def send_slot_created_embed(channel: discord.TextChannel, owner: discord.Member, created_at: str, expiry_iso: str, duration_label: str):
+    is_lifetime = expiry_iso is None
+    if is_lifetime:
+        expiry_text = "♾️ Never — Lifetime Slot"
+    else:
+        expiry_ts = int(datetime.fromisoformat(expiry_iso).timestamp())
+        expiry_text = f"<t:{expiry_ts}:F> (<t:{expiry_ts}:R>)"
+
+    created_ts = int(datetime.fromisoformat(created_at).timestamp())
+
+    embed = discord.Embed(
+        title="🎰 Shampoo MP — Slot Created",
+        description=f"Welcome {owner.mention}! Your slot is now active and ready to use.",
+        color=0xFF4444
+    )
+    embed.add_field(name="👤 Slot Owner", value=f"{owner.mention} (`{owner.id}`)", inline=True)
+    embed.add_field(name="📋 Channel", value=channel.mention, inline=True)
+    embed.add_field(name="📅 Created At", value=f"<t:{created_ts}:F>", inline=False)
+    embed.add_field(name="⏳ Duration", value=duration_label, inline=True)
+    embed.add_field(name="🔚 Expires", value=expiry_text, inline=True)
+    embed.add_field(
+        name="━━━━━━━━━━━━━━━━━━━━━━\n📌 Quick Commands",
+        value=(
+            "`/ping` — Send an @here or @everyone ping\n"
+            "`/stats` — View your slot statistics\n"
+            "`/redeem` — Redeem ping keys"
+        ),
+        inline=False
+    )
+    embed.set_thumbnail(url=THUMBNAIL_URL)
+    embed.set_footer(text=FOOTER_TEXT)
+    await channel.send(embed=embed)
+
 @bot.event
 async def on_ready():
     await bot.tree.sync()
@@ -141,10 +175,11 @@ async def on_ready():
 @app_commands.describe(
     type="Type of key to generate",
     amount="Number of keys to generate",
-    duration="Duration in days (only for License keys)"
+    duration="Duration in days (only for timed License keys)"
 )
 @app_commands.choices(type=[
     app_commands.Choice(name="License", value=KEY_TYPE_LICENSE),
+    app_commands.Choice(name="License (Lifetime)", value=KEY_TYPE_LICENSE_LIFETIME),
     app_commands.Choice(name="@here Ping", value=KEY_TYPE_HERE),
     app_commands.Choice(name="@everyone Ping", value=KEY_TYPE_EVERYONE),
 ])
@@ -155,12 +190,12 @@ async def generatekeys(interaction: discord.Interaction, type: str, amount: int,
         return
 
     if type == KEY_TYPE_LICENSE and duration is None:
-        await interaction.response.send_message("❌ Duration is required for License keys.", ephemeral=True)
+        await interaction.response.send_message("❌ Duration (in days) is required for timed License keys.", ephemeral=True)
         return
 
     valid_keys = load_json(VALID_KEYS_FILE)
     new_keys = []
-    expiry = (datetime.utcnow() + timedelta(days=duration)).isoformat() if duration else None
+    expiry = (datetime.utcnow() + timedelta(days=duration)).isoformat() if (type == KEY_TYPE_LICENSE and duration) else None
 
     for _ in range(amount):
         key = generate_key()
@@ -168,7 +203,7 @@ async def generatekeys(interaction: discord.Interaction, type: str, amount: int,
             key = generate_key()
         valid_keys[key] = {
             "type": type,
-            "duration_days": duration,
+            "duration_days": duration if type == KEY_TYPE_LICENSE else ("Lifetime" if type == KEY_TYPE_LICENSE_LIFETIME else None),
             "expiry": expiry,
             "generated_at": datetime.utcnow().isoformat(),
             "generated_by": str(interaction.user.id),
@@ -180,8 +215,13 @@ async def generatekeys(interaction: discord.Interaction, type: str, amount: int,
 
     save_json(VALID_KEYS_FILE, valid_keys)
 
-    type_label = {"license": "License", "everyone_ping": "@everyone Ping", "here_ping": "@here Ping"}[type]
-    duration_text = f" — {duration} day(s) each" if duration else ""
+    type_label = {
+        KEY_TYPE_LICENSE: "License",
+        KEY_TYPE_LICENSE_LIFETIME: "Lifetime License",
+        KEY_TYPE_EVERYONE: "@everyone Ping",
+        KEY_TYPE_HERE: "@here Ping"
+    }[type]
+    duration_text = f" — {duration} day(s) each" if (type == KEY_TYPE_LICENSE and duration) else (" — Lifetime" if type == KEY_TYPE_LICENSE_LIFETIME else "")
     keys_display = "\n".join(f"`{k}`" for k in new_keys)
 
     await interaction.response.send_message(
@@ -309,13 +349,14 @@ async def redeem(interaction: discord.Interaction, key: str):
         await interaction.response.send_message("❌ Slot category not found. Please contact an admin.", ephemeral=True)
         return
 
+    is_lifetime = key_type == KEY_TYPE_LICENSE_LIFETIME
     channel_name = f"{interaction.user.name.lower().replace(' ', '-')}-slot"
-
     channel = await guild.create_text_channel(channel_name, category=category)
     await apply_slot_permissions(channel, interaction.user, guild)
 
     redeemed_at = datetime.utcnow().isoformat()
-    expiry_iso = key_data["expiry"]
+    expiry_iso = None if is_lifetime else key_data["expiry"]
+    duration_label = "Lifetime" if is_lifetime else f"{key_data['duration_days']} day(s)"
 
     valid_keys[key]["redeemed"] = True
     valid_keys[key]["redeemed_by"] = user_id
@@ -329,8 +370,8 @@ async def redeem(interaction: discord.Interaction, key: str):
         "key_redeemed": key,
         "redeemed_at": redeemed_at,
         "expiry": expiry_iso,
-        "duration_days": key_data["duration_days"],
-        "time_remaining": time_remaining(expiry_iso),
+        "duration_days": "Lifetime" if is_lifetime else key_data["duration_days"],
+        "time_remaining": "Lifetime" if is_lifetime else time_remaining(expiry_iso),
         "slot_channel_id": str(channel.id),
         "slot_channel_name": channel_name,
         "guild_id": str(guild.id),
@@ -340,13 +381,15 @@ async def redeem(interaction: discord.Interaction, key: str):
     }
     save_json(USER_DB_FILE, user_db)
 
-    embed = build_embed(
+    await send_slot_created_embed(channel, interaction.user, redeemed_at, expiry_iso, duration_label)
+
+    dm_embed = build_embed(
         title=":rocket: **Subscription Activated**",
         description=(
             f"Hey {interaction.user.mention}, your slot subscription is now **live**!\n\n"
             f"A dedicated channel has been created exclusively for you — use it to promote your products, services, or anything you'd like to share with the community.\n\n"
-            f"📅 **Duration:** {key_data['duration_days']} day(s)\n"
-            f"⏳ **Expires:** <t:{int(datetime.fromisoformat(expiry_iso).timestamp())}:F>\n"
+            f"📅 **Duration:** {duration_label}\n"
+            + (f"⏳ **Expires:** <t:{int(datetime.fromisoformat(expiry_iso).timestamp())}:F>\n" if not is_lifetime else "♾️ **Expires:** Never\n") +
             f"📦 **Your Channel:** {channel.mention}\n\n"
             f"Make the most of your slot and don't hesitate to reach out to staff if you need any assistance!"
         ),
@@ -354,7 +397,7 @@ async def redeem(interaction: discord.Interaction, key: str):
     )
 
     try:
-        await interaction.user.send(embed=embed)
+        await interaction.user.send(embed=dm_embed)
         await interaction.response.send_message("✅ Key redeemed! Check your DMs for details.", ephemeral=True)
     except discord.Forbidden:
         await interaction.response.send_message(f"✅ Key redeemed! Your slot channel {channel.mention} has been created. (Enable DMs to receive confirmation)", ephemeral=True)
@@ -401,20 +444,21 @@ async def make_slot(interaction: discord.Interaction, user: discord.Member, chan
     }
     save_json(USER_DB_FILE, user_db)
 
-    embed = build_embed(
-        title=":rocket: **Lifetime Slot Activated**",
-        description=(
-            f"Hey {user.mention}, your **lifetime** slot has been set up by staff!\n\n"
-            f"Your dedicated channel is ready to go — use it to promote your products, services, or anything you'd like to share with the community.\n\n"
-            f"♾️ **Duration:** Lifetime\n"
-            f"📦 **Your Channel:** {channel.mention}\n\n"
-            f"Make the most of your slot and don't hesitate to reach out to staff if you need any assistance!"
-        ),
-        color=0xD2B48C
-    )
+    await send_slot_created_embed(channel, user, assigned_at, None, "Lifetime")
 
     try:
-        await user.send(embed=embed)
+        dm_embed = build_embed(
+            title=":rocket: **Lifetime Slot Activated**",
+            description=(
+                f"Hey {user.mention}, your **lifetime** slot has been set up by staff!\n\n"
+                f"Your dedicated channel is ready to go — use it to promote your products, services, or anything you'd like to share with the community.\n\n"
+                f"♾️ **Duration:** Lifetime\n"
+                f"📦 **Your Channel:** {channel.mention}\n\n"
+                f"Make the most of your slot and don't hesitate to reach out to staff if you need any assistance!"
+            ),
+            color=0xD2B48C
+        )
+        await user.send(embed=dm_embed)
     except discord.Forbidden:
         pass
 
